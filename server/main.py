@@ -1,58 +1,77 @@
+"""Launcher for asynchronous federated learning.
+
+Starts the FastAPI server, spawns the client processes, waits for training to
+finish, then prints the final metrics. (Synchronous version: sync_main.py)
+"""
 import os
-import random
+import subprocess
+import sys
+import time
 
-import numpy as np
-import pandas as pd
-import torch
-from sklearn.model_selection import train_test_split
-
-from client import Client
-from evaluation import evaluate
-from network import ANN_Model
-from preprocessing import Preprocessor
-from server import Server
+import requests
 
 NUM_CLIENTS = 5
-ROUNDS = 20
+MAX_UPDATES = 100  # same total number of local trainings as sync: 20 rounds x 5 clients
 LOCAL_EPOCHS = 5
 LR = 0.01
-SEED = 20
+MAX_DELAY = 3.0
+HOST, PORT = "127.0.0.1", 8000
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(HERE, "..", "dataset.csv")
+URL = f"http://{HOST}:{PORT}"
 
 
-def split_iid(X, y, num_clients, rng):
-    idx = rng.permutation(len(X))
-    return [(X[s], y[s]) for s in np.array_split(idx, num_clients)]
+def wait_for_server(proc, timeout=120):
+    start = time.time()
+    while time.time() - start < timeout:
+        if proc.poll() is not None:
+            raise RuntimeError("Server exited early")
+        try:
+            requests.get(f"{URL}/status", timeout=1)
+            return
+        except requests.RequestException:
+            time.sleep(0.5)
+    raise TimeoutError("Server did not start in time")
 
 
 def main():
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-
-    df = pd.read_csv(DATA_PATH)
-    train_df, test_df = train_test_split(
-        df, test_size=0.2, random_state=0, stratify=df["diabetes"]
+    env = dict(
+        os.environ,
+        FL_NUM_CLIENTS=str(NUM_CLIENTS),
+        FL_MAX_UPDATES=str(MAX_UPDATES),
     )
+    server = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "api_server:app", "--host", HOST,
+         "--port", str(PORT), "--log-level", "warning"],
+        cwd=HERE, env=env,
+    )
+    clients = []
+    try:
+        wait_for_server(server)
+        for i in range(NUM_CLIENTS):
+            clients.append(subprocess.Popen(
+                [sys.executable, "async_client.py", "--id", str(i),
+                 "--num-clients", str(NUM_CLIENTS), "--url", URL,
+                 "--epochs", str(LOCAL_EPOCHS), "--lr", str(LR),
+                 "--max-delay", str(MAX_DELAY)],
+                cwd=HERE,
+            ))
+        for c in clients:
+            c.wait()
 
-    prep = Preprocessor().fit(train_df)
-    X_train, y_train = prep.transform(train_df)
-    X_test, y_test = prep.transform(test_df)
-
-    shards = split_iid(X_train, y_train, NUM_CLIENTS, np.random.default_rng(SEED))
-    clients = [Client(i, X, y) for i, (X, y) in enumerate(shards)]
-
-    global_model = ANN_Model(input_features=prep.num_features)
-    server = Server(global_model, clients, X_test, y_test)
-    server.train(ROUNDS, LOCAL_EPOCHS, LR)
-
-    final = evaluate(global_model, X_test, y_test)
-    print("\nFinal accuracy:", round(final["accuracy"], 4))
-    print("Confusion matrix (rows=actual, cols=predicted):\n", final["confusion_matrix"])
-
-    torch.save(global_model.state_dict(), os.path.join(HERE, "global_model.pt"))
+        status = requests.get(f"{URL}/status", timeout=10).json()
+        latest = status["latest"]
+        print(f"\nAccepted updates: {status['accepted']} | rejected: {status['rejected']}")
+        if latest:
+            print("Final accuracy:", round(latest["accuracy"], 4),
+                  "| recall:", round(latest["recall"], 4))
+            print("Confusion matrix (rows=actual, cols=predicted):\n", latest["confusion_matrix"])
+    finally:
+        for c in clients:
+            if c.poll() is None:
+                c.terminate()
+        server.terminate()
+        server.wait()
 
 
 if __name__ == "__main__":
