@@ -19,7 +19,7 @@ LR = 0.01
 SEED = 20
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(HERE, "..", "dataset.csv")
+DATA_PATH = os.path.join(HERE, "..", "data", "dataset.csv")
 
 
 def split_iid(X, y, num_clients, rng):

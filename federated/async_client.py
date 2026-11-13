@@ -4,10 +4,17 @@ import time
 
 import requests
 import torch
+from sklearn.metrics import confusion_matrix
 
 from client import Client
 from common import load_data, state_from_json, state_to_json
 from network import ANN_Model
+
+
+def predict(model, X):
+    model.eval()
+    with torch.no_grad():
+        return model(torch.from_numpy(X)).argmax(dim=1).numpy()
 
 
 def run(args):
@@ -16,7 +23,10 @@ def run(args):
 
     prep, shards, _ = load_data(args.num_clients)
     X, y = shards[args.id]
-    client = Client(args.id, X, y)
+    # Each client keeps a private validation slice; the server never sees it.
+    n_val = max(1, int(0.2 * len(X)))
+    X_val, y_val = X[:n_val], y[:n_val]
+    client = Client(args.id, X[n_val:], y[n_val:])
     model = ANN_Model(input_features=prep.num_features)
     session = requests.Session()
 
@@ -28,6 +38,9 @@ def run(args):
         model.load_state_dict(state_from_json(resp["weights"]))
         base_version = resp["version"]
 
+        val_cm = confusion_matrix(
+            y_val, predict(model, X_val), labels=[0, 1]
+        ).tolist()
         weights, n, loss = client.train(model, args.epochs, args.lr)
 
         time.sleep(rng.uniform(0, args.max_delay))
@@ -39,6 +52,7 @@ def run(args):
                 "base_version": base_version,
                 "num_samples": n,
                 "weights": state_to_json(weights),
+                "val_confusion_matrix": val_cm,
             },
             timeout=30,
         ).json()

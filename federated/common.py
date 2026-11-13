@@ -9,7 +9,12 @@ from preprocessing import Preprocessor
 
 SEED = 20
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(HERE, "..", "dataset.csv")
+DATA_PATH = os.path.join(HERE, "..", "data", "dataset.csv")
+
+
+# Fixed feature schema agreed up front, so the server can build a randomly
+# initialised model without ever touching any data.
+NUM_FEATURES = 15
 
 
 def load_data(num_clients):
