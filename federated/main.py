@@ -1,8 +1,10 @@
-"""Launcher: starts the federated server, creates a unique session id and waits.
+"""Launcher: starts the federated server, creates a unique session id and keeps running.
 
-Participants join by uploading their CSV to  POST /join/<session_id>.
-Training finishes after MAX_UPDATES accepted updates; the final model is saved
-to global_model_async.pt.  (Synchronous simulation: sync_main.py)
+Participants join with real_client.py (private mode) or by uploading a CSV to
+POST /join/<session_id>. Training is continuous: the global model keeps
+improving as clients push updates, and is checkpointed to global_model_async.pt
+every FL_CHECKPOINT_EVERY accepted updates. Press Ctrl+C to stop; a final
+checkpoint is saved first.
 """
 import os
 import subprocess
@@ -12,7 +14,6 @@ import uuid
 
 import requests
 
-MAX_UPDATES = int(os.environ.get("FL_MAX_UPDATES", 100))
 HOST = os.environ.get("FL_HOST", "0.0.0.0")  # 0.0.0.0 lets other machines reach the server
 PORT = int(os.environ.get("FL_PORT", 8000))
 PUBLIC_HOST = os.environ.get("FL_PUBLIC_HOST", "127.0.0.1")  # address shown in the join URL
@@ -35,12 +36,13 @@ def wait_for_server(proc, timeout=120):
 
 
 def main():
-    session_id = uuid.uuid4().hex
+    resume = "--resume" in sys.argv  # reload global_model_async.pt instead of random init
+    session_id = os.environ.get("FL_SESSION_ID") or uuid.uuid4().hex
     public_url = f"http://{PUBLIC_HOST}:{PORT}"
     env = dict(
         os.environ,
         FL_SESSION_ID=session_id,
-        FL_MAX_UPDATES=str(MAX_UPDATES),
+        FL_RESUME="1" if resume else "0",
         FL_SERVER_URL=LOCAL_URL,  # server-side workers talk to the server locally
     )
     server = subprocess.Popen(
@@ -50,7 +52,8 @@ def main():
     )
     try:
         wait_for_server(server)
-        print("Global model initialised (random weights, version 0).")
+        print("Global model loaded from global_model_async.pt." if resume
+              else "Global model initialised (random weights, version 0).")
         print(f"Session id : {session_id}")
         print(f"Join URL   : POST {public_url}/join/{session_id}   (multipart field 'file' = CSV)")
         print(f'Example    : curl -F "file=@my_data.csv" {public_url}/join/{session_id}')
@@ -58,27 +61,29 @@ def main():
         print("Private    : python real_client.py "
               f"--session-id {session_id} --data my_data.csv --url {public_url}")
         print("            (private mode: data stays on the participant's machine)")
-        print(f"Training ends after {MAX_UPDATES} accepted updates. Ctrl+C to stop.\n", flush=True)
+        print("Training is continuous. Press Ctrl+C to save a checkpoint and stop.\n", flush=True)
 
         while True:
             if server.poll() is not None:
                 raise RuntimeError("Server exited unexpectedly")
-            status = requests.get(f"{LOCAL_URL}/status", timeout=10).json()
-            if status["done"]:
-                break
             time.sleep(2)
-
-        time.sleep(2)  # let finishing workers exit
-        latest = status["latest"]
-        print(f"\nAccepted updates: {status['accepted']} | rejected: {status['rejected']}")
-        if latest:
-            print("Final accuracy:", round(latest["accuracy"], 4),
-                  "| recall:", round(latest["recall"], 4))
-            print("Confusion matrix (rows=actual, cols=predicted):\n", latest["confusion_matrix"])
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
-        server.terminate()
+        if server.poll() is None:
+            try:
+                requests.post(f"{LOCAL_URL}/checkpoint",
+                              headers={"X-Session-Id": session_id}, timeout=30)
+                status = requests.get(f"{LOCAL_URL}/status", timeout=10).json()
+                print(f"Accepted updates: {status['accepted']} | rejected: {status['rejected']}")
+                latest = status["latest"]
+                if latest:
+                    print("Final accuracy:", round(latest["accuracy"], 4),
+                          "| macro recall:", round(latest["recall"], 4))
+                print("Model saved to global_model_async.pt")
+            except requests.RequestException:
+                pass
+            server.terminate()
         server.wait()
 
 

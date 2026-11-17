@@ -1,0 +1,4 @@
+python main.py 
+python real_client.py --session-id <sessuin_id> --data <dataset_path> --url http://127.0.0.1:8000
+python real_client.py --evaluate --session-id <session_id> --data "<dataset_path>" --url http://127.0.0.1:8000 --name client_name
+ curl.exe -H "X-Session-Id: <session_id>" http://127.0.0.1:8000/eval-report
